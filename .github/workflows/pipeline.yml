@@ -1,0 +1,117 @@
+name: CI/CD Pipeline
+
+on: [push]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+      - name: Install dependencies
+        run: yarn install
+      - name: Build
+        run: yarn build
+      - name: Save build artifacts
+        uses: actions/upload-artifact@v2
+        with:
+          name: build-artifacts
+          path: |
+            build
+            src
+            public
+            templates
+            package.json
+            node_modules
+
+  linter:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+      - name: Install dependencies
+        run: yarn install
+      - name: Run linter
+        run: yarn lint
+
+  dast:
+    runs-on: ubuntu-latest
+    services:
+      docker:
+        image: docker:19.03.12
+        options: --privileged
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+      - name: Install dependencies
+        run: yarn install
+      - name: Build
+        run: yarn build
+      - name: Start server
+        run: |
+          yarn global add serve
+          serve -s build &
+          sleep 10
+      - name: Verify server
+        run: curl http://localhost:3000 | grep "React App"
+      - name: Run ZAP scan
+        run: |
+          docker pull softwaresecurityproject/zap-stable:latest
+          docker run --user $(id -u):$(id -g) --rm -v $(pwd):/zap/wrk:rw -p 3000:3000 softwaresecurityproject/zap-stable:latest zap-baseline.py -j -t http://localhost:3000 -d -x zap-output.xml
+      - name: Upload ZAP report
+        uses: actions/upload-artifact@v2
+        with:
+          name: zap-output
+          path: zap-output.xml
+
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      - name: Set up Node.js
+        uses: actions/setup-node@v2
+        with:
+          node-version: '16'
+      - name: Install dependencies
+        run: yarn install
+      - name: Run tests
+        run: yarn test
+
+  compliance:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v2
+      - name: Install tools
+        run: |
+          apk add jq curl
+      - name: Check SAST results
+        run: |
+          jq -r '.vulnerabilities[] | select(.severity == "Critical") | (.severity, .message, .location, .identifiers[].url)' gl-sast-report.json > results.txt
+          jq -r '.vulnerabilities[] | select(.severity == "High") | (.severity, .message, .location, .identifiers[].url)' gl-sast-report.json >> results.txt
+          jq -r '.vulnerabilities[] | select(.severity == "Medium") | (.severity, .message, .location, .identifiers[].url)' gl-sast-report.json >> results.txt
+          cat results.txt
+          curl --location --request POST ${DEFECT_DOJO_URL} \
+            --header 'Authorization:Token ${DEFECT_DOJO_KEY}' \
+            --form 'product_name=Appstarter' \
+            --form 'engagement=13' \
+            --form 'verified=true' \
+            --form 'active=true' \
+            --form 'scan_type=GitLab Secret Detection Report' \
+            --form 'deduplication_on_engagement=false' \
+            --form 'close_old_findings_product_scope=true' \
+            --form 'close_old_findings=true' \
+            --form 'file=@gl-secret-detection-report.json'
